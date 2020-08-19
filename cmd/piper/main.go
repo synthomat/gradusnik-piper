@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -9,19 +8,16 @@ import (
 	"github.com/influxdata/influxdb-client-go/api"
 	log "github.com/sirupsen/logrus"
 	"os"
+	"regexp"
+	"strconv"
+	p "synthomat.de/sensorius/piper"
 	"time"
 )
-
-type Aqara struct {
-	Temperature float32 `json:"temperature"`
-	Humidity    float32 `json:"humidity"`
-	Pressure    float32 `json:"pressure"`
-}
 
 type MeasureData map[string]interface{}
 
 type Storage interface {
-	LogData(data Aqara)
+	LogData(data p.Aqara)
 }
 
 type InfluxDB struct {
@@ -29,7 +25,7 @@ type InfluxDB struct {
 	writer api.WriteAPI
 }
 
-func (idb InfluxDB) LogData(data Aqara) {
+func (idb InfluxDB) LogData(data p.Aqara) {
 	fmt.Println("Logging ", data)
 
 	tags := map[string]string{"unit": "temperature"}
@@ -114,16 +110,38 @@ func main() {
 	}
 
 	messageHandler := func(client mqtt.Client, message mqtt.Message) {
-		var data Aqara
-		if err := json.Unmarshal(message.Payload(), &data); err != nil {
-			log.Error("Cannot parse JSON", err)
-			return
+		if val, err := strconv.ParseFloat(string(message.Payload()[:]), 32); err == nil {
+			regp := *regexp.MustCompile(`rooms/(?P<room>.+)/(?P<metric>.+)`)
+			grps := regp.FindAllStringSubmatch(message.Topic(), -1)
+			var unit string
+			switch grps[0][2] {
+			case "humidity":
+				unit = "percent"
+			case "presure":
+				unit = "millibar"
+			case "temperature":
+				unit = "celsius"
+			}
+
+			metric := fmt.Sprintf("%s_%s", grps[0][2], unit)
+			tags := map[string]string{"room": grps[0][1]}
+
+			values := map[string]interface{}{
+				"value": val,
+			}
+
+			p := influxdb2.NewPoint(
+				metric,
+				tags,
+				values,
+				time.Now())
+
+			target.writer.WritePoint(p)
+
 		}
-		fmt.Println(data)
-		target.LogData(data)
 	}
 
-	if token := c.Subscribe("zigbee2mqtt/+", 0, messageHandler); token.Wait() && token.Error() != nil {
+	if token := c.Subscribe("rooms/#", 0, messageHandler); token.Wait() && token.Error() != nil {
 		fmt.Println(token.Error())
 		os.Exit(1)
 	}
