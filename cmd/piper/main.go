@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -8,11 +9,17 @@ import (
 	"github.com/influxdata/influxdb-client-go/api"
 	log "github.com/sirupsen/logrus"
 	"os"
-	"regexp"
-	"strconv"
+	"strings"
 	p "synthomat.de/sensorius/piper"
 	"time"
 )
+
+var sensorToRoom = map[string]string{
+	"ws-aqara-01": "bedroom",
+	"ws-aqara-02": "livingroom",
+	"ws-aqara-03": "office",
+	"ws-aqara-04": "childroom",
+}
 
 type MeasureData map[string]interface{}
 
@@ -110,38 +117,42 @@ func main() {
 	}
 
 	messageHandler := func(client mqtt.Client, message mqtt.Message) {
-		if val, err := strconv.ParseFloat(string(message.Payload()[:]), 32); err == nil {
-			regp := *regexp.MustCompile(`rooms/(?P<room>.+)/(?P<metric>.+)`)
-			grps := regp.FindAllStringSubmatch(message.Topic(), -1)
-			var unit string
-			switch grps[0][2] {
-			case "humidity":
-				unit = "percent"
-			case "presure":
-				unit = "millibar"
-			case "temperature":
-				unit = "celsius"
-			}
+		sensor := strings.TrimPrefix(message.Topic(), "zigbee2mqtt/")
+		room, ok := sensorToRoom[sensor]
 
-			metric := fmt.Sprintf("%s_%s", grps[0][2], unit)
-			tags := map[string]string{"room": grps[0][1]}
-
-			values := map[string]interface{}{
-				"value": val,
-			}
-
-			p := influxdb2.NewPoint(
-				metric,
-				tags,
-				values,
-				time.Now())
-
-			target.writer.WritePoint(p)
-
+		if !ok {
+			log.Warn(fmt.Sprintf("Sensor name '%s' could not be mapped to a room", sensor))
+			return
 		}
+
+		var data p.Aqara
+		if err := json.Unmarshal(message.Payload(), &data); err != nil {
+			log.Error("Cannot parse JSON", err)
+			return
+		}
+
+		metricName := fmt.Sprintf("weather")
+		tags := map[string]string{
+			"location": room,
+		}
+
+		values := map[string]interface{}{
+			"temp":     data.Temperature,
+			"humidity": data.Humidity,
+			"presure":  data.Pressure,
+		}
+
+		point := influxdb2.NewPoint(
+			metricName,
+			tags,
+			values,
+			time.Now())
+
+		log.Info("Received: ", tags, values, time.Now())
+		target.writer.WritePoint(point)
 	}
 
-	if token := c.Subscribe("rooms/#", 0, messageHandler); token.Wait() && token.Error() != nil {
+	if token := c.Subscribe("zigbee2mqtt/#", 0, messageHandler); token.Wait() && token.Error() != nil {
 		fmt.Println(token.Error())
 		os.Exit(1)
 	}
